@@ -24,6 +24,7 @@ import requests
 from agent.app import App
 from agent.base import AgentException, Base
 from agent.exceptions import InvalidSiteConfigException, SiteNotExistsException
+from agent.k8s_executor import k8s_execute, resolve_namespace_and_pod_selector
 from agent.job import job, step
 from agent.site import Site
 from agent.utils import download_file, end_execution, get_execution_result, get_size
@@ -182,22 +183,63 @@ class Bench(Base):
         non_zero_throw=True,
         as_root: bool = False,
     ):
-        interactive = "-i" if input else ""
-        as_root = "-u root" if as_root else ""
-        workdir = "/home/frappe/frappe-bench"
-        if subdir:
-            workdir = os.path.join(workdir, subdir)
+        """K8s/k3s replacement body -- see agent/k8s_executor.py's k8s_execute()
+        for the actual exec mechanism and its full Docker->K8s mapping notes.
 
-        if self.bench_config.get("single_container"):
-            command = f"docker exec {as_root} -w {workdir} {interactive} {self.name} {command}"
+        External signature and return contract are unchanged from the Docker
+        implementation this replaces, so all existing callers (bench.py,
+        server.py's _stop_bench_workers/_start_bench_workers, web.py's
+        /benches/<bench>/docker_execute route) work with zero changes to
+        their own call syntax. See docs/ANALYSIS.md and the kagent repo's
+        commit history for the reconciliation this replacement was checked
+        against (D6/D24/D30, COMMANDS.md, run-all-tests.sh) before landing.
+        """
+        # self.log() (called below) reads self.skip_output_log -- previously
+        # only ever set as a side effect of Base.execute(), which this body
+        # no longer calls. Found live: the first Step C harness run crashed
+        # here with AttributeError on the very first real call. False (never
+        # skip logging output) matches Base.execute()'s own default.
+        self.skip_output_log = False
+        try:
+            namespace, pod_label_selector = resolve_namespace_and_pod_selector(self.name)
+            result = k8s_execute(
+                command,
+                namespace=namespace,
+                pod_label_selector=pod_label_selector,
+                subdir=subdir,
+                input=input,
+                non_zero_throw=non_zero_throw,
+                as_root=as_root,
+            )
+        except AgentException as e:
+            self.data = e.data
+            self.log()
+            raise
+        except ValueError as e:
+            # resolve_namespace_and_pod_selector() only understands this
+            # cluster's "bench-{suffix}" naming convention (see its own
+            # docstring in k8s_executor.py) -- wrapped so docker_execute()
+            # keeps a single, uniform exception type (AgentException)
+            # regardless of which phase fails, matching what every existing
+            # caller already handles.
+            now = datetime.now()
+            synthetic = {
+                "command": command,
+                "directory": self.name,
+                "status": "Failure",
+                "output": str(e),
+                "returncode": -1,
+                "start": now,
+                "end": now,
+                "duration": timedelta(0),
+            }
+            self.data = synthetic
+            self.log()
+            raise AgentException(synthetic) from e
         else:
-            service = f"{self.name}_worker_default"
-            task = self.execute(f"docker service ps -f desired-state=Running -q --no-trunc {service}")[
-                "output"
-            ].split()[0]
-            command = f"docker exec {as_root} -w {workdir} {interactive} {service}.1.{task} {command}"
-
-        return self.execute(command, input=input, non_zero_throw=non_zero_throw)
+            self.data = result
+            self.log()
+            return result
 
     @step("New Site")
     def bench_new_site(self, name, mariadb_root_password, admin_password):

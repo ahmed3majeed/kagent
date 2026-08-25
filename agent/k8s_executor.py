@@ -662,6 +662,27 @@ def k8s_execute(
         output = resp.read_all()
         resp.close()
 
+        # Strip exactly one trailing newline, matching Base.execute()'s own
+        # established contract: its parse_output() rebuilds output as
+        # "\n".join(lines), where `lines` comes from splitting the stream on
+        # `\n` -- for any output ending in `\n`, that reconstruction always
+        # drops exactly that one final newline (confirmed by tracing the
+        # logic: "abc\n" -> lines=["abc"] -> "abc"; "abc\n\n" ->
+        # lines=["abc",""] -> "abc\n", i.e. one "\n" consumed either way; no
+        # trailing "\n" at all -> unchanged). resp.read_all() does no such
+        # reconstruction, so it preserves whatever the remote shell actually
+        # sent verbatim. Found live, not theorized: bench.py's
+        # set_git_remote() compares `res["output"] == url` for its
+        # early-exit optimization -- `git remote get-url` always prints a
+        # trailing newline, so without this fix that comparison silently
+        # never matched, and every call re-did a needless remove+add cycle
+        # instead of a true no-op. Every one of the 31 real callers was
+        # built against Base.execute()'s no-trailing-newline contract, not
+        # this function's raw one -- this restores that contract exactly,
+        # not just approximately.
+        if output.endswith("\n"):
+            output = output[:-1]
+
         if on_output_line:
             # Fires once the full output is already known (see
             # "Known deviations" #2 in this function's docstring) rather
