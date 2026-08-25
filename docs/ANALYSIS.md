@@ -261,6 +261,68 @@ container runtime.
 ---
 
 ## proxy.py
+
+### Verification Note (follow-up check, re-read in full a second time)
+Sanity check requested because this project's architecture already decided to use
+Traefik (k3s's built-in Ingress Controller) for routing, and a "0 changes" verdict on
+the proxy file needed confirming as *actually* zero, not skipped.
+
+**1. Does this file generate/manage nginx config, or only call a proxy assumed to
+already exist?** It generates and manages real nginx config directly.
+`_generate_proxy_config()` (line 341) renders `proxy/nginx.conf.jinja2` into a live
+`proxy.conf` file from `self.hosts`/`self.upstreams`/`self.wildcards`;
+`add_host`/`add_wildcard_hosts`/`add_upstream`/`add_site_to_upstream`/`setup_redirect`/
+`update_site_status` all write real files under `hosts_directory`/`upstreams_directory`
+(`map.json`, `redirect.json`, per-site status files, TLS cert symlinks) that the
+rendered config reads; `setup_proxy()`/`_reload_nginx()` actually trigger
+`sudo systemctl reload nginx` / `NginxReloadManager().request_reload(...)`. This is a
+complete, active config-generation-and-reload component, not a stub.
+
+**2. Any reverse-proxy logic assuming Docker networking (container IPs, `docker
+network inspect`, etc.)?** No. Re-confirmed via a full second read (498/498 lines) and
+`grep -n -i docker` returning zero matches. No container-IP resolution, no Docker
+API/CLI call of any kind anywhere in the file. The upstream *target* values it writes
+to disk are opaque strings handed to it by callers (bench.py's port-mapping logic
+decides what those strings actually are) — proxy.py never computes or interprets a
+Docker network address itself.
+
+**3. Is the nginx→Traefik transition already handled entirely outside this file, or
+does this file need updates we missed?** Partially — and the two things aren't quite
+the same migration, worth being precise about:
+- At the **code level** (does anything in proxy.py need to change because it calls
+  Docker): nothing to change — confirmed above, 0 Docker references. The item count
+  for this file stays 0/0/0, unchanged from the first pass.
+- At the **architecture level** (does proxy.py's *function* still need to exist once
+  Kagent is fully K8s-native): less settled than "already handled entirely outside
+  this file." proxy.py's nginx tier and this project's Traefik/IngressRoute work solve
+  *related but not identical* problems. proxy.py runs on Frappe Cloud's own dedicated
+  Proxy Servers, doing Host-header-based routing across *many separate bench servers*,
+  plus redirects, wildcard domains, per-site maintenance/suspended-status toggling, and
+  **weighted auto-scale routing across secondary upstreams**
+  (`secondaries.json`/`set_secondaries_for_upstream`, lines 386-421). This project's
+  Traefik testing so far has proven the routing and maintenance-mode pieces at the
+  *single-bench-pod* level (D11: a bench needs a Service before an IngressRoute means
+  anything; K5: a real IngressRoute wired to a real Service; M1: adding a domain via a
+  new IngressRoute; Tier C7/C9: Host-based routing plus a `router.middlewares`
+  annotation referencing a maintenance Middleware) — these line up well with
+  `add_host`/`update_site_status`. **Not yet proven anywhere in this project's testing:
+  a Traefik-native equivalent of the weighted secondary/auto-scale routing.** Tier C9's
+  own finding also notes the maintenance Middleware referenced by the tested annotation
+  didn't actually exist yet at that point ("this annotation references a middleware
+  that doesn't exist ... would have no actual effect until created") — so even the
+  closest-matching piece was validated at the annotation-mechanism level, not as a
+  complete working example.
+
+**Bottom line:** proxy.py needs no Docker-runtime code changes — the original verdict
+for the file itself was correct, not skipped. But whether the whole file becomes dead
+code under a fully K8s-native Kagent, or whether some of its logic (specifically the
+weighted-secondaries/auto-scale piece) still needs to exist until a proven Traefik
+equivalent is built and tested, is an open architecture question this file-level scan
+can't resolve on its own — flagging for a decision before treating the file as simply
+"done."
+
+---
+
 498 lines. **Zero Docker references of any kind** — confirmed via `grep -n -i docker`
 returning no matches.
 
