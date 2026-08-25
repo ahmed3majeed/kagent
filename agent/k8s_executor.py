@@ -294,21 +294,35 @@ def k8s_execute(
             failure mode the same way it does today.
 
     Known deviations from docker_execute()'s original contract (bench.py
-    callers will need to account for these when this gets wired in):
+    callers will need to account for these when this gets wired in).
+    Reconciled against frappe-k3s-agent's verified project history
+    (docs/COMMANDS.md's ~86+21+11+4+11 tested commands across Phases 1-3,
+    tests/run-all-tests.sh's full suite, and Decision Log D24/D30/D37/D38 in
+    full) -- see the module's git history for the reconciliation pass; each
+    item below states what that check found, not just what design intended:
 
-    1. **`as_root` has no real K8s exec API equivalent.** Docker's `-u root`
-       sets the exec'd process's UID at the container-runtime level; the
-       Kubernetes exec subresource has no per-call user-override parameter
-       at all -- this is a K8s API limitation in general, not a k3s-specific
-       one. This function falls back to wrapping the command in
-       `su root -c '...'` inside the container, which only works if the
-       target image has `su` configured to let the exec'd user become root
-       without a password. **This has not been verified against the real
-       frappe/bench image** -- flag for verification before any
-       `as_root=True` call site is wired in; the fallback may need to become
-       `sudo -n` or a pod securityContext-level redesign instead.
+    1. **`as_root` has no real K8s exec API equivalent, and this project has
+       never verified a working alternative.** Docker's `-u root` sets the
+       exec'd process's UID at the container-runtime level; the Kubernetes
+       exec subresource has no per-call user-override parameter at all --
+       a K8s API limitation in general, not a k3s-specific one. This
+       function falls back to wrapping the command in `su root -c '...'`
+       inside the container, which only works if the target image has `su`
+       configured to let the exec'd user become root without a password.
+       **Still unverified against the real frappe/bench image after
+       checking:** COMMANDS.md/RUNBOOK.md's only root-related finding
+       (Phase 3 Group Q) is about a *whole Pod* running as root via its
+       spec/securityContext -- a different mechanism from a per-exec-call
+       user override -- and that finding argues *against* reusing the
+       pattern ("worth designing the real Agent's upload/download containers
+       to run as the frappe UID instead"), not for adopting it. No better
+       verified alternative exists in this project's history to switch to;
+       flag for real verification before any `as_root=True` call site is
+       wired in.
     2. **No live output streaming to Redis yet, and `on_output_line` fires
-       post-hoc, not truly incrementally.** `Base.execute()` calls
+       post-hoc, not truly incrementally -- confirmed not a blocker for
+       anything this project has verified, though it remains a real gap for
+       live human-facing progress.** `Base.execute()` calls
        `self.publish_lines()` -> `self.update_redis()` as output arrives
        line-by-line, which is how the Job system shows live progress during
        a long-running step. This function fully drains the exec stream
@@ -317,11 +331,22 @@ def k8s_execute(
        was tried (polling the stream's stdout/stderr channels while looping)
        and dropped: it could race the channel-3 exit-status frame against
        the WebSocket close frame and lose it, since `.returncode` only
-       reads that channel while the connection is still open. Restoring true
-       live streaming needs a version of that loop that reserves channel 3
-       for the final drain instead of racing it -- left for the bench.py
-       integration task, once there's a real caller (a Job's `publish_lines`)
-       to validate the fix against.
+       reads that channel while the connection is still open. Checked
+       against every one of tests/run-all-tests.sh's ~160 assertions and
+       every entry in COMMANDS.md: **none of them read output incrementally
+       -- every verification in this project's history either discards
+       output entirely (`&>/dev/null`) or captures it in full via command
+       substitution before matching, even for commands with genuinely
+       progress-bar-style stdout** (`rebuild-global-search`, `bench build`).
+       So this deviation is confirmed safe for reproducing this project's
+       already-verified command set as-is; it only becomes a real blocker
+       for a *new* requirement this project's own test history never
+       needed -- a human/UI watching a long `migrate`/`backup`/`build` live,
+       which is a Job-system UX concern, not a command-correctness one.
+       Restoring true live streaming needs a version of the polling loop
+       that reserves channel 3 for the final drain instead of racing it --
+       left for the bench.py integration task, once there's a real caller
+       (a Job's `publish_lines`) to validate the fix against.
     3. **`input` (stdin) is accepted but not yet forwarded to the exec
        stream.** docker_execute() supported piping stdin (`-i` flag) --
        at least one real call site needs this (bench.py's
@@ -359,6 +384,69 @@ def k8s_execute(
        a real, deliberate value change, not a rename -- worth flagging
        explicitly since it's the kind of thing that's easy to miss in a
        mechanical find-and-replace pass over the 43 call sites.
+    7. **D24 (multi-container pods) is verified against one of two real
+       topologies in this cluster, not both -- the second doesn't need
+       `_resolve_container()` at all.** Live-tested here only against
+       frappe-v16's `redis-v16` pod (3 containers: redis-cache/redis-queue/
+       redis-socketio). Confirmed live that frappe-v14's `redis-v14` pod
+       uses the identical single-pod/3-sidecar-container topology (same
+       container names) -- untested directly but structurally identical, no
+       code change implied. frappe-system's Bitnami-chart Redis (what
+       frappe-v15 actually uses) is architecturally different: **3 separate
+       single-container pods** (`redis-cache-master-0` etc., each with one
+       container literally named `redis`), not one pod with 3 containers --
+       confirmed live (`kubectl get pod -l app.kubernetes.io/instance=redis-
+       cache -o jsonpath='{.spec.containers[*].name}'` -> `redis`, singular).
+       That topology needs no D24 disambiguation at all;
+       `_resolve_container()`'s single-container auto-detect path already
+       handles it correctly without a `container` argument. No other
+       multi-container-pod scenario is referenced anywhere in COMMANDS.md or
+       run-all-tests.sh.
+    8. **D30 (silent-on-success commands) is covered generically, not just
+       for `run-patch`.** This function's `status`/`returncode` logic never
+       inspects `output` at all, for any command -- success is exit-code-
+       only, unconditionally. Cross-checked against every command in
+       COMMANDS.md marked silent-on-success or version-inconsistent on
+       stdout (`add-system-manager`, `clear-cache`, `clear-website-cache`,
+       `set-maintenance-mode on|off`, `run-patch` on v16, and `bench
+       backup`'s D28 absolute-vs-relative-path inconsistency across
+       versions) -- all of them are correctly handled by construction, since
+       none of them get special-cased; the generic exit-code-only contract
+       already covers the whole set. run-all-tests.sh's own A27 test
+       independently reaches the same conclusion for non-v16 versions too
+       (`warn`, not `fail`, when the "verbose" text is merely absent but
+       exit code is 0) -- exit code is the authoritative signal everywhere
+       in this project's verified history, not just on v16.
+    9. **D38 (SIGPIPE/pipefail) does not apply to this module or its
+       callers, by construction -- confirmed against every piping example
+       in COMMANDS.md, not just the ones considered during design.** This
+       function never shells out and never builds an orchestrator-side pipe
+       at all -- the Python kubernetes client's WebSocket stream has no
+       process-piping step for a local `grep -q`-style reader to race
+       against. The one place COMMANDS.md documents a similar-looking
+       pattern (`kubectl exec {pod} -- ps aux | grep gunicorn`, Group D's
+       translation table for `docker top | grep gunicorn`) would run
+       *inside* the remote pod's own `bash -c`, not through this module's
+       own process -- and since this function's wrapper never sets
+       `pipefail` in that remote shell, D38's specific failure mode (an
+       upstream SIGPIPE masking as the pipeline's reported status) doesn't
+       apply there either. Once wired into bench.py, callers get a plain
+       Python string back (`result["output"]`) and would do a Python
+       substring check (`"gunicorn" in output`), which has no process-pipe,
+       hence no SIGPIPE, involved at all.
+    10. **D37 (kubectl patch resources:{} silent no-op) doesn't apply to
+        this module -- it touches no Deployment resource limits/requests at
+        all, only pod exec.** Flagged here only as a forward note so it
+        isn't forgotten: whatever module eventually implements bench.py's
+        `_update_runtime_limits()` equivalent (ANALYSIS.md's bench.py
+        architectural gap #3, `kubectl patch deployment` on resources) MUST
+        clear a previously-set resource field with explicit `null` per
+        subfield (`{"resources":{"limits":null,"requests":null}}`), never
+        an empty `{}` -- confirmed by this project's own test suite hitting
+        this exact bug live (a leftover 512Mi/200m limit from an `{}`-based
+        "clear" attempt OOM-killed a later `bench build`, per D37 and
+        run-all-tests.sh's C4 comment). Not this file's concern today, but
+        directly relevant the moment resource-limit patching gets built.
     """
     _load_kube_config()
     core_v1 = client.CoreV1Api()
