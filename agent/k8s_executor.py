@@ -272,9 +272,14 @@ def k8s_execute(
             yet forwarded to the exec stream in this first isolated pass.
         non_zero_throw: if True (default, matches docker_execute()), raise
             AgentException on non-zero exit instead of returning normally.
-        as_root: **best-effort only** -- see "Known deviations" #1, this is
-            a real capability gap versus `docker exec -u root`, not just an
-            unimplemented convenience.
+        as_root: runs the command via `sudo -n` -- see "Known deviations" #1
+            for how this was live-verified (and why the earlier `su root -c`
+            attempt was dropped, not just relabeled) against all three
+            supported bench versions. There is still no true K8s exec-API
+            equivalent to `docker exec -u root`; this depends on the target
+            image granting the exec'd user passwordless sudo, which the
+            frappe/bench image does today but a future image might not --
+            `sudo -n` fails fast and loud in that case rather than hanging.
         on_output_line: optional callback invoked with each line of output
             as it streams in. Not wired to Job/Redis in this isolated
             module -- exists so the eventual bench.py integration can pass a
@@ -301,24 +306,45 @@ def k8s_execute(
     full) -- see the module's git history for the reconciliation pass; each
     item below states what that check found, not just what design intended:
 
-    1. **`as_root` has no real K8s exec API equivalent, and this project has
-       never verified a working alternative.** Docker's `-u root` sets the
-       exec'd process's UID at the container-runtime level; the Kubernetes
-       exec subresource has no per-call user-override parameter at all --
-       a K8s API limitation in general, not a k3s-specific one. This
-       function falls back to wrapping the command in `su root -c '...'`
-       inside the container, which only works if the target image has `su`
-       configured to let the exec'd user become root without a password.
-       **Still unverified against the real frappe/bench image after
-       checking:** COMMANDS.md/RUNBOOK.md's only root-related finding
-       (Phase 3 Group Q) is about a *whole Pod* running as root via its
-       spec/securityContext -- a different mechanism from a per-exec-call
-       user override -- and that finding argues *against* reusing the
-       pattern ("worth designing the real Agent's upload/download containers
-       to run as the frappe UID instead"), not for adopting it. No better
-       verified alternative exists in this project's history to switch to;
-       flag for real verification before any `as_root=True` call site is
-       wired in.
+    1. **`as_root` has no real K8s exec API equivalent -- resolved via
+       `sudo -n`, live-verified against all three supported versions.**
+       Docker's `-u root` sets the exec'd process's UID at the
+       container-runtime level; the Kubernetes exec subresource has no
+       per-call user-override parameter at all -- a K8s API limitation in
+       general, not a k3s-specific one, so this still has to be solved
+       inside the container rather than at the exec-API level. An earlier
+       pass used `su root -c '...'` and left it explicitly unverified.
+       Checking the project's history first: COMMANDS.md/RUNBOOK.md's only
+       root-related finding (Phase 3 Group Q) is about a *whole Pod* running
+       as root via its spec/securityContext (a Job's container defaulted to
+       root, leaving root-owned scratch files on a shared PVC) -- a
+       different mechanism from a per-exec-call user override, and that
+       finding argues *against* reusing pod-level root, not for it. That
+       ruled out one candidate but didn't supply a replacement, so this was
+       tested directly against the real bench pods instead of left as a
+       guess: `su root -c whoami` against the live bench-v16 pod genuinely
+       fails (`su: Authentication failure` -- no password is available over
+       `kubectl exec`, so `su` can never work here regardless of image).
+       `sudo -n whoami` against the same pod returns `root` cleanly, and the
+       same command was re-verified against bench-v14 and bench-v15 too --
+       all three return `root` identically (`sudo -l` on bench-v16 confirms
+       why: `(ALL) NOPASSWD: ALL` is configured for the `frappe` user in the
+       frappe/bench image). This function now wraps `as_root=True` commands
+       as `sudo -n {command}` instead of `su root -c '...'` -- the `-n` flag
+       makes sudo fail fast with a clear error if a future/different image
+       doesn't have `NOPASSWD` configured, instead of hanging on a password
+       prompt until this function's timeout. Real callers: bench.py has
+       exactly 2 fixed `as_root=True` call sites today (`server.py`
+       `_stop_bench_workers`/`_start_bench_workers`, lines 384/397 --
+       `supervisorctl stop/start frappe-bench-web: frappe-bench-workers:`,
+       needing root because supervisord itself runs as root in this image)
+       plus one open-ended surface: the `/benches/<bench>/docker_execute`
+       HTTP route (`web.py:1899`) passes `as_root=data.get("as_root")`
+       straight through from the request body, so any caller of that
+       endpoint (i.e. Press) can request root for an arbitrary command, not
+       just these 2 fixed sites -- worth keeping in mind once this is wired
+       in, since the real exposure isn't bounded to what bench.py's own
+       source shows.
     2. **No live output streaming to Redis yet, and `on_output_line` fires
        post-hoc, not truly incrementally -- confirmed not a blocker for
        anything this project has verified, though it remains a real gap for
@@ -466,8 +492,22 @@ def k8s_execute(
 
         inner_command = command
         if as_root:
-            # Best-effort only -- see "Known deviations" #1 above.
-            inner_command = f"su root -c {shlex.quote(inner_command)}"
+            # `sudo -n`, not `su root -c` -- see "Known deviations" #1 above
+            # for how this was verified: `su root -c` was live-tested against
+            # the real bench-v16 pod and genuinely fails
+            # ("su: Authentication failure", no password available over
+            # kubectl exec). `sudo -n whoami` was live-tested and returns
+            # "root" cleanly on all three supported versions (v14/v15/v16) --
+            # the frappe/bench image ships `frappe` with passwordless sudo
+            # (`sudo -l` shows `(ALL) NOPASSWD: ALL`). `-n` makes sudo fail
+            # fast with a clear error instead of hanging on a password prompt
+            # if a future/different image doesn't have NOPASSWD configured,
+            # rather than silently blocking until this function's timeout.
+            # No extra quoting needed here (unlike `su -c`, which takes the
+            # whole command as one string argument) -- `sudo` just execs the
+            # next word with the rest as its own argv, identical to typing
+            # `sudo <command>` directly in a shell.
+            inner_command = f"sudo -n {inner_command}"
 
         full_command = f"cd {shlex.quote(effective_workdir)} && {inner_command}"
         # /bin/sh, not /bin/bash: confirmed live that not every container in
