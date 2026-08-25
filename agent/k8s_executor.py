@@ -67,6 +67,7 @@ from typing import TYPE_CHECKING, Callable
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
+from kubernetes.stream.ws_client import STDIN_CHANNEL
 
 from agent.exceptions import AgentException
 from agent.utils import get_execution_result
@@ -193,6 +194,66 @@ def _resolve_container(pod: V1Pod, container: str | None) -> str:
     )
 
 
+def resolve_namespace_and_pod_selector(bench_name: str) -> tuple[str, str]:
+    """Derive k8s_execute()'s required `namespace`/`pod_label_selector` from a
+    bench name -- a Tier 0 prerequisite for wiring `Bench.docker_execute()`
+    to `k8s_execute()`, built and live-tested standalone here, NOT yet called
+    from bench.py (bench.py is untouched -- this function exists so that
+    integration is a one-line call once it's approved, not a redesign).
+
+    **This encodes the naming convention this project's own validation
+    cluster (92.5.91.195) demonstrates, confirmed live for every real bench
+    in it -- it is NOT necessarily the real production Kagent namespace
+    scheme.** This cluster organizes namespaces per Frappe *version*
+    (`frappe-v14`/`frappe-v15`/`frappe-v16`, one shared test bench each) to
+    prove out version-branching behavior; a real multi-tenant Kagent would
+    far more plausibly namespace per *tenant/site*, not per Frappe version.
+    Whoever wires this in for real needs to confirm which convention the
+    actual Bench-provisioning code will use -- don't assume this function's
+    current logic transfers unchanged to production naming.
+
+    Convention (`bench-{suffix}` -> namespace `frappe-{suffix}`, selector
+    `app=bench-{suffix}`), confirmed live against the two benches that
+    follow it:
+    - `bench-v14` -> (`frappe-v14`, `app=bench-v14`) -- live-verified,
+      resolves to the real `bench-v14-...` pod and a working `k8s_execute()`
+      call against it.
+    - `bench-v16` -> (`frappe-v16`, `app=bench-v16`) -- live-verified, same.
+
+    **Known gap, found by testing rather than assumed away:** `bench-v15`
+    would derive to (`frappe-v15`, `app=bench-v15`) under this same
+    convention, but the real `bench-v15` pod carries **no labels at all**
+    (`kubectl get pod bench-v15 -n frappe-v15 --show-labels` -> `<none>`,
+    confirmed live) -- it's the project's known bare-Pod legacy state (D16
+    already mandates every bench should be a Deployment, never a bare Pod,
+    specifically because of gaps like this one). A selector this function
+    derives for v15 will resolve to zero pods and `k8s_execute()` will raise
+    `PodNotFoundError` -- this is not a bug in this function, it's an
+    accurate reflection of v15's pod having nothing to select. Wiring v15
+    through this path requires either giving that pod a matching label
+    (a one-time `kubectl label`, the same workaround
+    `tests/run-all-tests.sh` already uses temporarily for its own v15
+    IngressRoute test) or migrating it to a proper Deployment first, per D16.
+
+    Raises:
+        ValueError: if `bench_name` doesn't start with `"bench-"` -- this
+            function only knows the one convention above, and refuses to
+            guess at any other bench-naming scheme silently.
+    """
+    prefix = "bench-"
+    if not bench_name.startswith(prefix):
+        raise ValueError(
+            f"resolve_namespace_and_pod_selector() only knows the 'bench-{{suffix}}' "
+            f"naming convention this test cluster uses; got {bench_name!r}, which "
+            f"doesn't start with {prefix!r}. Pass namespace/pod_label_selector to "
+            f"k8s_execute() explicitly instead of relying on this helper."
+        )
+    suffix = bench_name[len(prefix):]
+    namespace = f"frappe-{suffix}"
+    pod_label_selector = f"app={bench_name}"
+    return namespace, pod_label_selector
+
+
 def k8s_execute(
     command: str,
     *,
@@ -268,8 +329,11 @@ def k8s_execute(
             "/home/frappe/frappe-bench" working directory. Defaults to
             DEFAULT_WORKDIR.
         subdir: joined onto workdir, exactly like docker_execute()'s `subdir`.
-        input: reserved for stdin support -- see "Known deviations" #3, not
-            yet forwarded to the exec stream in this first isolated pass.
+        input: piped to the exec stream's stdin, then the stream's stdin
+            channel is half-closed so the remote process sees a real EOF --
+            see "Known deviations" #3 for how this was live-verified
+            (a plain `cat` round-trip, and a real `bench console` piped
+            script matching this project's `site.py`/COMMANDS.md usage).
         non_zero_throw: if True (default, matches docker_execute()), raise
             AgentException on non-zero exit instead of returning normally.
         as_root: runs the command via `sudo -n` -- see "Known deviations" #1
@@ -373,15 +437,28 @@ def k8s_execute(
        that reserves channel 3 for the final drain instead of racing it --
        left for the bench.py integration task, once there's a real caller
        (a Job's `publish_lines`) to validate the fix against.
-    3. **`input` (stdin) is accepted but not yet forwarded to the exec
-       stream.** docker_execute() supported piping stdin (`-i` flag) --
-       at least one real call site needs this (bench.py's
-       `install-app --force`, per D7's stdin-piped-password requirement).
-       The kubernetes client's stream API does support a stdin channel
-       (`stdin=True` on the `stream()` call + `resp.write_stdin(...)`), so
-       this is a "not implemented in this first pass" gap, not a platform
-       limitation like #1 -- straightforward to add when wiring in the call
-       sites that actually need it.
+    3. **`input` (stdin) is now forwarded to the exec stream -- live-verified,
+       not just implemented.** docker_execute() supported piping stdin
+       (`-i` flag); this function now opens the stream's stdin channel
+       whenever `input is not None` (matching docker_execute()'s own
+       `-i`-only-when-input-given behavior), writes the payload via
+       `resp.write_stdin(...)`, then explicitly half-closes the stdin
+       channel (`resp.close_channel(STDIN_CHANNEL)`, v5.channel.k8s.io
+       protocol -- confirmed live to be what this cluster negotiates) so the
+       remote process sees a genuine EOF, the same signal a closed pipe
+       gives a real `docker exec -i`. Live-tested two ways against the real
+       bench-v16 pod: a plain `cat` echoing arbitrary piped text back
+       (proves the EOF-based mechanism generally, not tied to any
+       particular command's own quirks), and the actual real-world
+       dependency this project has -- `bench --site {site} console` with a
+       piped Python script ending in `exit`, the exact pattern
+       `site.py:749`/`926` (`bench_execute("console", input=...)`) and
+       COMMANDS.md's own verified "console (via stdin)" entry rely on.
+       Both returned correct output. Note this doesn't itself resolve D7's
+       separate `install-app --force` stdin-password requirement (untested
+       here -- no site currently has a reinstall-worthy app state to safely
+       exercise that path against), but the underlying mechanism this
+       function now uses is the same one that path would need.
     4. **`directory` field repurposed.** The base `ExecutionResult` dict's
        `directory` key held a host filesystem path under Docker (passed to
        `subprocess.Popen(cwd=...)`). There's no equivalent host-directory
@@ -530,11 +607,30 @@ def k8s_execute(
             container=resolved_container,
             command=exec_command,
             stderr=True,
-            stdin=False,
+            stdin=input is not None,
             stdout=True,
             tty=False,
             _preload_content=False,
         )
+
+        if input is not None:
+            # Mirrors docker_execute()'s `-i` flag (only opened when `input`
+            # is given -- matches the `stdin=` value passed to stream() just
+            # above). Write the payload, then explicitly half-close the
+            # stdin channel (v5.channel.k8s.io protocol, confirmed live to
+            # be what this cluster negotiates -- `resp.subprotocol` ==
+            # "v5.channel.k8s.io") so the remote process sees a real EOF on
+            # stdin, the same signal a closed pipe gives a real
+            # `docker exec -i`. This is more general than relying solely on
+            # a magic "exit" command in the payload (the approach this
+            # project's own run-all-tests.sh uses for `bench console`,
+            # since IPython's exit-confirmation prompt hangs on a closed-
+            # but-not-EOF'd stdin otherwise) -- that trick still works fine
+            # here too (tested below), but explicit EOF also covers a
+            # program that reads until EOF rather than watching for a
+            # specific command.
+            resp.write_stdin(input)
+            resp.close_channel(STDIN_CHANNEL)
 
         # run_forever() is the kubernetes client's own tested drain loop --
         # it blocks until the stream closes (or timeout elapses), reading
@@ -677,3 +773,66 @@ if __name__ == "__main__":
     assert res2["status"] == "Success"
     print(f"PASS: explicit container='redis-cache' on the multi-container redis-v16 "
           f"pod worked, returncode={res2['returncode']}")
+
+    # --- Tier 0 prerequisite 1: resolve_namespace_and_pod_selector() ---
+    # v14 and v16 follow the convention and resolve to real, reachable pods.
+    print("\n=== resolve_namespace_and_pod_selector() dry-run ===")
+    for bench_name, container in (("bench-v14", "bench"), ("bench-v16", "bench")):
+        ns, selector = resolve_namespace_and_pod_selector(bench_name)
+        res3 = k8s_execute("whoami", namespace=ns, pod_label_selector=selector, container=container)
+        assert res3["status"] == "Success"
+        print(f"PASS: {bench_name} -> namespace={ns!r} selector={selector!r} -- "
+              f"k8s_execute() reached the real pod, whoami={res3['output'].strip()!r}")
+
+    # v15 is a KNOWN, documented gap (bare Pod, no labels at all) -- this
+    # must fail, and fail with the expected error, not silently succeed or
+    # fail for some other reason.
+    ns15, selector15 = resolve_namespace_and_pod_selector("bench-v15")
+    assert (ns15, selector15) == ("frappe-v15", "app=bench-v15")
+    try:
+        k8s_execute("whoami", namespace=ns15, pod_label_selector=selector15)
+    except AgentException as e:
+        assert "No Running pod found" in e.data["output"]
+        print(f"CONFIRMED GAP (expected, documented): bench-v15 -> namespace={ns15!r} "
+              f"selector={selector15!r} correctly finds no pod -- {e.data['output']}")
+    else:
+        raise AssertionError(
+            "expected bench-v15 to fail (bare Pod, no labels) -- if this now succeeds, "
+            "v15's pod configuration changed and this function's docstring needs updating"
+        )
+
+    # --- Tier 0 prerequisite 2: stdin forwarding ---
+    print("\n=== stdin forwarding dry-run ===")
+
+    # General mechanism check: `cat` echoes whatever it reads from stdin
+    # until EOF, then exits -- this proves the write+close-channel EOF
+    # signal itself, independent of any command-specific "type an exit
+    # command" trick.
+    payload = "stdin-forward-mechanism-check\n"
+    res4 = k8s_execute("cat", namespace="frappe-v16", pod_label_selector="app=bench-v16",
+                        container="bench", input=payload, workdir="/")
+    assert res4["status"] == "Success"
+    assert payload.strip() in res4["output"]
+    print(f"PASS: cat echoed back piped stdin via a real EOF close, output={res4['output']!r}")
+
+    # Real dependency this project actually has: site.py:749/926 call
+    # bench_execute("console", input=script) -- reproduce that exact shape
+    # against a real site (v16-test.local, per this project's cluster
+    # notes) with a script ending in `exit`, matching COMMANDS.md's own
+    # verified "console (via stdin)" pattern and run-all-tests.sh's A25
+    # comment about why the explicit `exit` is needed (IPython's
+    # exit-confirmation prompt otherwise hangs on a closed stdin).
+    console_script = "print('stdin-forward-console-check')\nexit\n"
+    res5 = k8s_execute(
+        "bench --site v16-test.local console",
+        namespace="frappe-v16",
+        pod_label_selector="app=bench-v16",
+        container="bench",
+        input=console_script,
+        timeout=60,
+    )
+    assert res5["status"] == "Success"
+    assert "stdin-forward-console-check" in res5["output"]
+    print("PASS: `bench console` (real site v16-test.local) executed a piped script "
+          "and exited cleanly via the same EOF-close mechanism -- matches "
+          "site.py:749/926's real usage shape.")
