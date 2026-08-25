@@ -4,6 +4,37 @@ Docker→Kubernetes (k3s) migration analysis of `frappe/agent`, read directly fr
 `/home/frappe/kagent/agent/` on 92.5.91.195. Line numbers are taken from real
 `grep -n`/`cat -n` output against the cloned source, not estimated.
 
+## ⚠️ SECURITY — MUST RESOLVE BEFORE PRODUCTION
+
+**Location:** `agent/web.py:1890-1899`, HTTP route `POST /benches/<bench>/docker_execute`
+
+**Risk:** The route reads `as_root` straight from the raw request body
+(`as_root=data.get("as_root")`) with no validation, allowlist, or authorization check
+specific to the root request itself — any caller of this endpoint can request root
+execution of an arbitrary command on any bench.
+
+**Why this is urgent now, not theoretical:** as of this session, `k8s_execute(as_root=True)`
+is a verified, working root-exec path (`sudo -n`, confirmed live on v14/v15/v16 — see
+`agent/k8s_executor.py`'s "Known deviations" #1). Before that fix, `as_root` silently
+failed (`su root -c` → `Authentication failure`), so this endpoint's root request was
+already broken in practice. It is not broken anymore. Once `docker_execute()`'s call sites
+are wired to `k8s_execute()`, this HTTP route becomes a live, functioning
+privilege-escalation surface with no additional gate on it.
+
+**Status:** unresolved. Must be addressed — via authentication/authorization on the
+endpoint itself, an explicit allowlist of which commands may run as root, or removing the
+raw `as_root` pass-through entirely — before Kagent is exposed to Press or any real
+network traffic. Not addressed by, or in scope of, the `k8s_executor.py` work itself.
+
+Also found in the same pass (documented for completeness, not yet analyzed in depth):
+`agent/web.py` (2006 lines) was never covered by this document's original 6-file scan
+and has several other Docker-touching routes (`get_docker_image_size`,
+`push_docker_images_to_registry`, `pull_docker_images`, `/docker_cache_utils/<method>`
+which imports a wholly separate, also-unanalyzed `agent/docker_cache_utils.py`) — a
+dedicated `web.py`/`docker_cache_utils.py` analysis pass, matching this document's
+existing per-file format, is recommended before Kagent's Docker-removal is considered
+complete.
+
 ## Summary
 Total files to change: 4
 Total items to change: 88
