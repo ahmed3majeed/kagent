@@ -32,3 +32,4 @@ mariadb-table-usage==0.0.3
 psutil==7.0.0
 tomli==2.4.1
 semantic-version==2.10.0
+kubernetes==36.0.3
