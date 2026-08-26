@@ -1892,11 +1892,15 @@ def all_exception_handler(error):
 def docker_execute(bench: str):
     data = request.json
     _bench = Server().benches[bench]
+    # OR1: never honor caller-controlled as_root on this HTTP route.
+    # Internal Bench.docker_execute(..., as_root=True) call sites stay intact.
+    if data and data.get("as_root"):
+        return {"error": "as_root is not allowed over HTTP"}, 403
     result: ExecuteReturn = _bench.docker_execute(
         command=data.get("command"),
         subdir=data.get("subdir"),
         non_zero_throw=False,
-        as_root=data.get("as_root"),
+        as_root=False,
     )
 
     result["start"] = result["start"].isoformat()
