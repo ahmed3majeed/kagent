@@ -302,6 +302,30 @@ class TestK8sHostPathFallback(unittest.TestCase):
         self.assertEqual(public_file, "sites/restore.local/private/backups/files.tar")
         self.assertEqual(private_file, "sites/restore.local/private/backups/private-files.tar")
 
+    # -- install_app_job() should install via docker_execute in the pod
+    #    without needing a host-mounted site checkout (D6), same as new_site
+    #    and restore_job above. --
+
+    def test_install_app_job_uses_docker_execute_when_in_cluster(self):
+        site = self._get_restore_site(db_host="10.0.0.5", site_name="install.local")  # non-localhost -> in_cluster
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Site.install_app.__wrapped__(site, "erpnext")
+
+        mock_exec.assert_called_once_with(
+            "bench --site install.local install-app erpnext --force", input=None
+        )
+
+    def test_install_app_job_still_uses_docker_execute_when_not_in_cluster(self):
+        site = self._get_restore_site(db_host="localhost", site_name="install.local")  # docker/host mode -> unchanged
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Site.install_app.__wrapped__(site, "erpnext")
+
+        mock_exec.assert_called_once_with(
+            "bench --site install.local install-app erpnext --force", input=None
+        )
+
     def test_restore_job_still_downloads_when_not_in_cluster(self):
         site = self._get_restore_site(db_host="localhost")  # docker/host mode -> unchanged behaviour
         database_url = "https://restore.local/backups/db.sql.gz"
