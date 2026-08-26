@@ -269,6 +269,29 @@ class Site(Base):
 
         return {"output": data}
 
+    def _pod_backup_file(self, url):
+        """If `url`'s filename already exists in this site's backups dir on
+        the bench pod's own PVC (D6: no host-mounted checkout to check via
+        os.path.exists, same as _fetch_latest_backup_via_pod()), return the
+        bench-root-relative path -- bench_execute()'s docker_execute call
+        has its cwd at the bench root (no `subdir`), so this resolves
+        correctly passed straight through to `bench restore` without a
+        download+reupload round trip. Returns None (falls back to
+        download_files()) if there's no url or the pod doesn't have it.
+        """
+        if not url:
+            return None
+        filename = os.path.basename(urlparse(url).path)
+        if not filename:
+            return None
+        relative_backup_dir = f"sites/{self.name}/private/backups"
+        result = self.bench.docker_execute(
+            f"test -f {quote(filename)}", subdir=relative_backup_dir, non_zero_throw=False
+        )
+        if result.get("returncode") != 0:
+            return None
+        return f"{relative_backup_dir}/{filename}"
+
     @job("Restore Site")
     def restore_job(
         self,
@@ -281,7 +304,30 @@ class Site(Base):
         sanitized_config_content,
         skip_failing_patches,
     ):
-        files = self.bench.download_files(self.name, database, public, private)
+        # public/private only take the pod-relative-path shortcut alongside
+        # a database restore, i.e. when they'll be passed to
+        # restore_site()'s `bench restore` CLI flags (bench_execute() runs
+        # via docker_execute() already). When there's no database to
+        # restore, restore_files() below extracts these tars on the host
+        # filesystem directly (shutil/tarfile) and needs a real downloaded
+        # file, not a pod-relative path.
+        use_pod_files = self.bench.in_cluster and database
+        pod_database = self._pod_backup_file(database) if self.bench.in_cluster else None
+        pod_public = self._pod_backup_file(public) if use_pod_files else None
+        pod_private = self._pod_backup_file(private) if use_pod_files else None
+
+        downloaded = self.bench.download_files(
+            self.name,
+            None if pod_database else database,
+            None if pod_public else public,
+            None if pod_private else private,
+        )
+        files = {
+            "directory": downloaded["directory"],
+            "database": pod_database or downloaded["database"],
+            "public": pod_public or downloaded["public"],
+            "private": pod_private or downloaded["private"],
+        }
         is_database_restoration_required = False
         try:
             if files["database"]:
@@ -317,8 +363,9 @@ class Site(Base):
             self.set_admin_password(admin_password)
             self.enable_scheduler()
 
-            self.bench.setup_nginx()
-            self.bench.server.reload_nginx()
+            if not self.bench.in_cluster:
+                self.bench.setup_nginx()
+                self.bench.server.reload_nginx()
 
         return self.bench_execute("list-apps")
 

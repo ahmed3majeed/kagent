@@ -251,6 +251,85 @@ class TestK8sHostPathFallback(unittest.TestCase):
         mock_setup_nginx.assert_called_once()
         mock_reload_nginx.assert_called_once()
 
+    # -- restore_job() should skip download_files() for backup files that
+    #    already exist in the pod's own PVC (same backups dir bench backup()
+    #    writes into) instead of round-tripping them through the host (D6:
+    #    no host-mounted checkout for a k3s pod-only site). --
+
+    def _get_restore_site(self, db_host: str, site_name: str = "restore.local") -> Site:
+        bench = self._get_bench(db_host=db_host)
+        site_config = {"db_name": "restore_db", "db_password": "secret"}
+        if db_host in ("localhost", "127.0.0.1"):
+            self._create_test_site(site_name)
+            return Site(site_name, bench)
+        with patch.object(Bench, "docker_execute", return_value={"output": json.dumps(site_config)}):
+            return Site(site_name, bench)
+
+    def test_restore_job_skips_download_when_files_already_in_pod(self):
+        site = self._get_restore_site(db_host="10.0.0.5")  # non-localhost -> in_cluster
+        database_url = "https://restore.local/backups/db.sql.gz"
+        public_url = "https://restore.local/backups/files.tar"
+        private_url = "https://restore.local/backups/private-files.tar"
+
+        def fake_docker_execute(command, subdir=None, **kwargs):
+            if command.startswith("test -f"):
+                return {"returncode": 0}
+            raise AssertionError(f"unexpected docker_execute call: {command!r}")
+
+        with (
+            patch.object(Bench, "docker_execute", side_effect=fake_docker_execute),
+            patch.object(Bench, "download_files") as mock_download_files,
+            patch.object(Bench, "delete_downloaded_files"),
+            patch.object(Site, "restore_site") as mock_restore_site,
+            patch.object(Site, "uninstall_unavailable_apps"),
+            patch.object(Site, "migrate"),
+            patch.object(Site, "set_admin_password"),
+            patch.object(Site, "enable_scheduler"),
+            patch.object(Site, "bench_execute", return_value={"output": ""}),
+            patch.object(Bench, "setup_nginx"),
+            patch.object(site.bench.server, "reload_nginx", create=True),
+        ):
+            mock_download_files.return_value = {"directory": "/tmp/unused", "database": "", "public": "", "private": ""}
+
+            Site.restore_job.__wrapped__(
+                site, [], "root-pw", "admin-pw", database_url, public_url, private_url, None, False
+            )
+
+        mock_download_files.assert_called_once_with(site.name, None, None, None)
+        mock_restore_site.assert_called_once()
+        _, _, database_file, public_file, private_file = mock_restore_site.call_args.args
+        self.assertEqual(database_file, "sites/restore.local/private/backups/db.sql.gz")
+        self.assertEqual(public_file, "sites/restore.local/private/backups/files.tar")
+        self.assertEqual(private_file, "sites/restore.local/private/backups/private-files.tar")
+
+    def test_restore_job_still_downloads_when_not_in_cluster(self):
+        site = self._get_restore_site(db_host="localhost")  # docker/host mode -> unchanged behaviour
+        database_url = "https://restore.local/backups/db.sql.gz"
+
+        with (
+            patch.object(Bench, "download_files") as mock_download_files,
+            patch.object(Bench, "delete_downloaded_files"),
+            patch.object(Site, "restore_site") as mock_restore_site,
+            patch.object(Site, "uninstall_unavailable_apps"),
+            patch.object(Site, "migrate"),
+            patch.object(Site, "set_admin_password"),
+            patch.object(Site, "enable_scheduler"),
+            patch.object(Site, "bench_execute", return_value={"output": ""}),
+            patch.object(Bench, "setup_nginx"),
+            patch.object(site.bench.server, "reload_nginx", create=True),
+        ):
+            mock_download_files.return_value = {
+                "directory": "/tmp/unused",
+                "database": "/tmp/unused/db.sql.gz",
+                "public": "",
+                "private": "",
+            }
+
+            Site.restore_job.__wrapped__(site, [], "root-pw", "admin-pw", database_url, None, None, None, False)
+
+        mock_download_files.assert_called_once_with(site.name, database_url, None, None)
+        mock_restore_site.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
