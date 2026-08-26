@@ -422,6 +422,27 @@ class TestK8sHostPathFallback(unittest.TestCase):
         args, _ = mock_exec.call_args
         self.assertIn("--app erpnext", args[0])
 
+    # -- uninstall_app() should call docker_execute() with the uninstall-app
+    #    bench command, in_cluster or not (D6, same as install_app above). --
+
+    def test_uninstall_app_calls_docker_execute_when_in_cluster(self):
+        site = self._get_restore_site(db_host="10.0.0.5", site_name="uninstall.local")  # non-localhost -> in_cluster
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Site.uninstall_app.__wrapped__(site, "erpnext")
+
+        args, _ = mock_exec.call_args
+        self.assertIn("uninstall-app erpnext", args[0])
+
+    def test_uninstall_app_still_calls_docker_execute_when_not_in_cluster(self):
+        site = self._get_restore_site(db_host="localhost", site_name="uninstall.local")  # docker/host mode -> unchanged
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Site.uninstall_app.__wrapped__(site, "erpnext")
+
+        args, _ = mock_exec.call_args
+        self.assertIn("uninstall-app erpnext", args[0])
+
 
 if __name__ == "__main__":
     unittest.main()
