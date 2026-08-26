@@ -402,6 +402,26 @@ class TestK8sHostPathFallback(unittest.TestCase):
         args, _ = mock_exec.call_args
         self.assertIn("--web", args[0])
 
+    # -- rebuild() should call docker_execute() with the correct bench build
+    #    command when in_cluster --
+
+    def test_rebuild_calls_docker_execute_with_bench_build_when_in_cluster(self):
+        bench = self._get_bench(db_host="10.0.0.5")  # non-localhost -> in_cluster
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Bench.rebuild.__wrapped__(bench)
+
+        mock_exec.assert_called_once_with("bench build")
+
+    def test_rebuild_calls_docker_execute_with_app_flag_when_single_app(self):
+        bench = self._get_bench(db_host="10.0.0.5")  # non-localhost -> in_cluster
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Bench.rebuild.__wrapped__(bench, apps=["erpnext"], is_inplace=False)
+
+        args, _ = mock_exec.call_args
+        self.assertIn("--app erpnext", args[0])
+
 
 if __name__ == "__main__":
     unittest.main()
