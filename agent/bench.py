@@ -324,7 +324,10 @@ class Bench(Base):
         ]
         for query in queries:
             command = f'mysql -h {self.host} -P {self.db_port} -uroot -p{mariadb_root_password} -e "{query}"'
-            self.execute(command)
+            if self.host in ('localhost', '127.0.0.1'):
+                self.execute(command)
+            else:
+                self.docker_execute(command)
         return database, user, password
 
     def drop_mariadb_user(self, site, mariadb_root_password, database=None):
@@ -337,7 +340,10 @@ class Bench(Base):
         ]
         for query in queries:
             command = f'mysql -h {self.host} -P {self.db_port} -uroot -p{mariadb_root_password} -e "{query}"'
-            self.execute(command)
+            if self.host in ('localhost', '127.0.0.1'):
+                self.execute(command)
+            else:
+                self.docker_execute(command)
 
     def fetch_monitor_data(self):
         lines = []
