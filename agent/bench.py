@@ -77,6 +77,15 @@ class Bench(Base):
         ):
             raise Exception
 
+    @property
+    def in_cluster(self) -> bool:
+        """Whether this bench's site data lives only inside the k3s pod
+        rather than on a host-mounted checkout, using the same db_host
+        signal create_mariadb_user()/drop_mariadb_user() already use to
+        decide between self.execute() (host) and self.docker_execute() (pod).
+        """
+        return self.host not in ("localhost", "127.0.0.1")
+
     @step("Deploy Bench")
     def deploy(self):
         return self.start()

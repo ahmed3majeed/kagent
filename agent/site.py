@@ -44,19 +44,34 @@ class Site(Base):
             "analytics.json",
         )
 
-        if not os.path.isdir(self.directory):
-            raise OSError(f"Path {self.directory} is not a directory")
-
-        if not os.path.exists(self.config_file):
+        host_checkout_exists = os.path.isdir(self.directory) and os.path.exists(self.config_file)
+        if not host_checkout_exists and not self.bench.in_cluster:
+            if not os.path.isdir(self.directory):
+                raise OSError(f"Path {self.directory} is not a directory")
             raise OSError(f"Path {self.config_file} does not exist")
 
-        self.database = self.config["db_name"]
+        # k3s benches don't host-mount the pod's site checkout (D6), so a
+        # site created via docker_execute("bench new-site ...") only ever
+        # exists inside the pod -- read its config over the same exec path
+        # instead of requiring a host directory that will never appear.
+        site_config = self.config if host_checkout_exists else self._fetch_config_via_pod()
+
+        self.database = site_config["db_name"]
         self.user = (
-            self.config.get("db_user") or self.config["db_name"]
+            site_config.get("db_user") or site_config["db_name"]
         )  # Prefer the db user specified in site config, fallback to db name for backward compatibility
-        self.password = self.config["db_password"]
-        self.host = self.config.get("db_host", self.bench.host)
-        self.db_port = self.config.get("db_port", self.bench.db_port)
+        self.password = site_config["db_password"]
+        self.host = site_config.get("db_host", self.bench.host)
+        self.db_port = site_config.get("db_port", self.bench.db_port)
+
+    def _fetch_config_via_pod(self) -> dict:
+        """Read site_config.json straight from the pod's checkout (see
+        __init__'s host_checkout_exists branch) instead of the host path
+        Base.config assumes, for a site whose files only exist in-cluster."""
+        output = self.bench.docker_execute("cat site_config.json", subdir=os.path.join("sites", self.name))[
+            "output"
+        ]
+        return json.loads(output)
 
     def bench_execute(self, command, input=None):
         return self.bench.docker_execute(f"bench --site {self.name} {command}", input=input)
@@ -1597,10 +1612,22 @@ print(">>>" + frappe.session.sid + "<<<")
         return f"{chunk // 1024**2}M"
 
     def fetch_latest_backup(self, with_files=True):
-        databases, publics, privates, site_configs = [], [], [], []
         backup_directory = os.path.join(self.directory, "private", "backups")
 
-        for file in os.listdir(backup_directory):
+        try:
+            files = os.listdir(backup_directory)
+        except FileNotFoundError:
+            if not self.bench.in_cluster:
+                raise
+            # bench backup (see backup()/bench_execute() above) already
+            # succeeded inside the pod, but this bench has no host-mounted
+            # checkout (D6) to list -- pick the latest files over the same
+            # docker_execute exec path instead of failing the job on a
+            # host-side directory that was never going to exist.
+            return self._fetch_latest_backup_via_pod(with_files)
+
+        databases, publics, privates, site_configs = [], [], [], []
+        for file in files:
             path = os.path.join(backup_directory, file)
             if file.endswith("database.sql.gz") or file.endswith("database-enc.sql.gz"):
                 databases.append(path)
@@ -1624,6 +1651,50 @@ print(">>>" + frappe.session.sid + "<<<")
             file = os.path.basename(backup["path"])
             backup["file"] = file
             backup["size"] = os.stat(backup["path"]).st_size
+            backup["url"] = f"https://{self.name}/backups/{file}"
+
+        return backups
+
+    def _fetch_latest_backup_via_pod(self, with_files):
+        """fetch_latest_backup()'s classify-then-pick-newest logic, but
+        listing/sizing the backups over docker_execute instead of os.listdir
+        + os.stat, since the files only exist inside the bench pod. Backup
+        filenames are timestamp-prefixed (bench's own naming), so a
+        lexicographic max is equivalent to picking by mtime.
+        """
+        relative_backup_dir = f"sites/{self.name}/private/backups"
+        listing = self.bench.docker_execute(f"ls -1 {quote(relative_backup_dir)}")["output"]
+        files = [line.strip() for line in listing.splitlines() if line.strip()]
+
+        databases, publics, privates, site_configs = [], [], [], []
+        for file in files:
+            if file.endswith("database.sql.gz") or file.endswith("database-enc.sql.gz"):
+                databases.append(file)
+            elif file.endswith("private-files.tar") or file.endswith("private-files-enc.tar"):
+                privates.append(file)
+            elif file.endswith("files.tar") or file.endswith("files-enc.tar"):
+                publics.append(file)
+            elif file.endswith("site_config_backup.json") or file.endswith("site_config_backup-enc.json"):
+                site_configs.append(file)
+
+        backups = {
+            "database": {"file": max(databases)},
+            "site_config": {"file": max(site_configs)},
+        }
+        if with_files:
+            backups["private"] = {"file": max(privates)}
+            backups["public"] = {"file": max(publics)}
+
+        for backup in backups.values():
+            file = backup["file"]
+            # Path stays pod-relative (no host copy exists) -- callers that
+            # need to read backup bytes off disk (e.g. offsite upload) are
+            # out of scope for this fix and will need their own pod-aware path.
+            backup["path"] = os.path.join(self.directory, "private", "backups", file)
+            size_output = self.bench.docker_execute(
+                f"stat -c%s {quote(file)}", subdir=relative_backup_dir
+            )["output"]
+            backup["size"] = int(size_output.strip().splitlines()[-1])
             backup["url"] = f"https://{self.name}/backups/{file}"
 
         return backups
