@@ -354,6 +354,34 @@ class TestK8sHostPathFallback(unittest.TestCase):
         mock_download_files.assert_called_once_with(site.name, database_url, None, None)
         mock_restore_site.assert_called_once()
 
+    # -- archive_site() should call bench_archive_site() via docker_execute
+    #    even when the host site checkout is missing (D6: pod-only PVC), and
+    #    must skip host nginx when in_cluster (Traefik, same as new_site). --
+
+    def test_archive_site_calls_bench_archive_site_when_in_cluster_and_host_dir_missing(self):
+        bench = self._get_bench(db_host="10.0.0.5")  # non-localhost -> in_cluster
+
+        with (
+            patch.object(Bench, "bench_archive_site") as mock_archive,
+            patch.object(Bench, "setup_nginx") as mock_setup_nginx,
+            patch.object(bench.server, "_reload_nginx", create=True) as mock_reload_nginx,
+        ):
+            result = Bench.archive_site.__wrapped__(bench, "missing.local", "root-pw", False)
+
+        mock_archive.assert_called_once_with("missing.local", "root-pw", False)
+        mock_setup_nginx.assert_not_called()
+        mock_reload_nginx.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_archive_site_skips_bench_archive_site_when_not_in_cluster_and_host_dir_missing(self):
+        bench = self._get_bench(db_host="localhost")  # docker/host mode -> unchanged behaviour
+
+        with patch.object(Bench, "bench_archive_site") as mock_archive:
+            result = Bench.archive_site.__wrapped__(bench, "missing.local", "root-pw", False)
+
+        mock_archive.assert_not_called()
+        self.assertIsNone(result)
+
 
 if __name__ == "__main__":
     unittest.main()

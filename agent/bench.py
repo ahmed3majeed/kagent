@@ -551,7 +551,7 @@ class Bench(Base):
         site_directory = os.path.join(self.sites_directory, name)
         backups = None
 
-        if os.path.exists(site_directory):
+        if self.in_cluster or os.path.exists(site_directory):
             if offsite:
                 site = Site(name, self)
                 backup_files = site.backup(with_files=True)
@@ -572,8 +572,9 @@ class Bench(Base):
                 force,
             )
 
-            self.setup_nginx()
-            self.server._reload_nginx()
+            if not self.in_cluster:
+                self.setup_nginx()
+                self.server._reload_nginx()
 
         return backups
 
