@@ -461,8 +461,9 @@ class Bench(Base):
                 create_user.get("last_name"),
                 create_user.get("password"),
             )
-        self.setup_nginx()
-        self.server.reload_nginx()
+        if not self.in_cluster:
+            self.setup_nginx()
+            self.server.reload_nginx()
 
     @job("New Site from Backup", priority="high")
     def new_site_from_backup(

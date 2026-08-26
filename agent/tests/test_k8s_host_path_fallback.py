@@ -210,6 +210,47 @@ class TestK8sHostPathFallback(unittest.TestCase):
         with open(os.path.join(site_dir, "site_config.json"), "w") as f:
             json.dump({"db_name": "fake", "db_password": "fake"}, f)
 
+    # -- new_site() should not touch host nginx when in_cluster (D8): the
+    #    pod's `bench new-site` already succeeded, but host nginx isn't the
+    #    k3s ingress (Traefik is), and `sudo systemctl reload nginx` would
+    #    fail the job after the real work is done. --
+
+    def test_new_site_skips_host_nginx_when_in_cluster(self):
+        bench = self._get_bench(db_host="10.0.0.5")  # non-localhost -> in_cluster
+        site_config = {"db_name": "loop6_db", "db_password": "secret"}
+
+        with (
+            patch.object(Bench, "bench_new_site"),
+            patch.object(Site, "install_apps"),
+            patch.object(Site, "update_config"),
+            patch.object(Site, "enable_scheduler"),
+            patch.object(Bench, "docker_execute", return_value={"output": json.dumps(site_config)}),
+            patch.object(Bench, "setup_nginx") as mock_setup_nginx,
+            patch.object(bench.server, "reload_nginx", create=True) as mock_reload_nginx,
+        ):
+            Bench.new_site.__wrapped__(bench, "loop6.local", {}, [], "root-pw", "admin-pw")
+
+        mock_setup_nginx.assert_not_called()
+        mock_reload_nginx.assert_not_called()
+
+    def test_new_site_still_reloads_host_nginx_when_not_in_cluster(self):
+        bench = self._get_bench(db_host="localhost")  # docker/host mode -> unchanged behaviour
+        site_name = "host-mode-new.local"
+        self._create_test_site(site_name)
+
+        with (
+            patch.object(Bench, "bench_new_site"),
+            patch.object(Site, "install_apps"),
+            patch.object(Site, "update_config"),
+            patch.object(Site, "enable_scheduler"),
+            patch.object(Bench, "setup_nginx") as mock_setup_nginx,
+            patch.object(bench.server, "reload_nginx", create=True) as mock_reload_nginx,
+        ):
+            Bench.new_site.__wrapped__(bench, site_name, {}, [], "root-pw", "admin-pw")
+
+        mock_setup_nginx.assert_called_once()
+        mock_reload_nginx.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
