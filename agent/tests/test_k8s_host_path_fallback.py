@@ -382,6 +382,26 @@ class TestK8sHostPathFallback(unittest.TestCase):
         mock_archive.assert_not_called()
         self.assertIsNone(result)
 
+    # -- restart() should call docker_execute() with the correct bench restart
+    #    command when in_cluster --
+
+    def test_restart_calls_docker_execute_with_bench_restart_when_in_cluster(self):
+        bench = self._get_bench(db_host="10.0.0.5")  # non-localhost -> in_cluster
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Bench.restart.__wrapped__(bench, web_only=False)
+
+        mock_exec.assert_called_once_with("bench restart ")
+
+    def test_restart_calls_docker_execute_with_web_flag_when_web_only(self):
+        bench = self._get_bench(db_host="10.0.0.5")  # non-localhost -> in_cluster
+
+        with patch.object(Bench, "docker_execute", return_value={"output": ""}) as mock_exec:
+            Bench.restart.__wrapped__(bench, web_only=True)
+
+        args, _ = mock_exec.call_args
+        self.assertIn("--web", args[0])
+
 
 if __name__ == "__main__":
     unittest.main()
