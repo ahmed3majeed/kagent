@@ -57,8 +57,16 @@ class Bench(Base):
         self.apps_file = os.path.join(self.directory, "sites", "apps.txt")
         self.bench_config_file = os.path.join(self.directory, "config.json")
         self.config_file = os.path.join(self.directory, "sites", "common_site_config.json")
-        self.host = self.config.get("db_host", "localhost")
-        self.db_port = self.config.get("db_port", 3306)
+        # Prefer the bench common_site_config (in-cluster MariaDB) over the
+        # agent-wide config, which defaults to localhost for Docker hosts.
+        try:
+            import json as _json
+            with open(self.config_file) as _f:
+                _csc = _json.load(_f)
+        except Exception:
+            _csc = {}
+        self.host = _csc.get("db_host") or self.config.get("db_host", "localhost")
+        self.db_port = int(_csc.get("db_port") or self.config.get("db_port", 3306))
         self.docker_image = self.bench_config.get("docker_image")
         self.mounts = mounts
         if not (
