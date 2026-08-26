@@ -73,6 +73,34 @@ class Site(Base):
         ]
         return json.loads(output)
 
+    def _write_config_via_pod(self, value: dict, indent: int = 1) -> None:
+        """Write site_config.json inside the pod (see _fetch_config_via_pod)
+        instead of Base.set_config()'s host rename/copy dance, for a site
+        whose files only exist in-cluster."""
+        self.bench.docker_execute(
+            "cat > site_config.json",
+            input=json.dumps(value, indent=indent, sort_keys=True),
+            subdir=os.path.join("sites", self.name),
+        )
+
+    def get_config(self, for_update: bool = False) -> dict:
+        """Base.get_config() opens self.config_file on the host. A k3s
+        pod-only site (no host-mounted checkout, D6) never has that file --
+        fall back to reading it out of the pod instead. The for_update file
+        lock is skipped in that case: there's no host file to lock against,
+        and Job's one-worker-per-process model already serializes writes
+        within a single job.
+        """
+        if os.path.exists(self.config_file) or not self.bench.in_cluster:
+            return super().get_config(for_update=for_update)
+        return self._fetch_config_via_pod()
+
+    def set_config(self, value: dict, indent=1, release_lock: bool = True):
+        """Pod-only counterpart to get_config() above -- see its docstring."""
+        if os.path.exists(self.config_file) or not self.bench.in_cluster:
+            return super().set_config(value, indent=indent, release_lock=release_lock)
+        return self._write_config_via_pod(value, indent=indent)
+
     def bench_execute(self, command, input=None):
         return self.bench.docker_execute(f"bench --site {self.name} {command}", input=input)
 
@@ -1637,6 +1665,16 @@ print(">>>" + frappe.session.sid + "<<<")
                 publics.append(path)
             elif file.endswith("site_config_backup.json") or file.endswith("site_config_backup-enc.json"):
                 site_configs.append(path)
+
+        # The host backups directory can exist (e.g. pre-created, or leftover
+        # from an unrelated older backup) without containing the file that
+        # bench backup() just wrote inside the pod (D6: no host mount). An
+        # empty `databases`/`site_configs` here is the same "the real files
+        # are pod-only" case as the FileNotFoundError above, not a genuine
+        # missing-backup error -- fall back the same way instead of letting
+        # max() raise ValueError on an empty sequence.
+        if self.bench.in_cluster and not (databases and site_configs and (not with_files or (privates and publics))):
+            return self._fetch_latest_backup_via_pod(with_files)
 
         backups = {
             "database": {"path": max(databases, key=os.path.getmtime)},

@@ -116,6 +116,100 @@ class TestK8sHostPathFallback(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             site.fetch_latest_backup(with_files=False)
 
+    def test_fetch_latest_backup_falls_back_when_host_dir_exists_but_has_no_matching_files(self):
+        """Live repro (Backup Site job 9, 2026-08-26): the host backups
+        directory exists (empty, or holding unrelated files) but the real
+        backup only landed in the pod -- os.listdir() succeeds so the
+        FileNotFoundError branch never fires, and max() on an empty list
+        used to raise ValueError instead of falling back."""
+        bench = self._get_bench(db_host="10.0.0.5")
+        site_name = "backed-up.local"
+        site_dir = os.path.join(self.sites_directory, site_name)
+        os.makedirs(site_dir)
+        with open(os.path.join(site_dir, "site_config.json"), "w") as f:
+            json.dump({"db_name": "fake", "db_password": "fake"}, f)
+        # Host backups dir exists, but empty -- no host-mounted PVC, D6.
+        os.makedirs(os.path.join(site_dir, "private", "backups"))
+        site = Site(site_name, bench)
+
+        pod_files = [
+            "20260101_000000-backed_up-database.sql.gz",
+            "20260101_000000-backed_up-site_config_backup.json",
+        ]
+
+        def fake_docker_execute(command, subdir=None, **kwargs):
+            if command.startswith("ls -1"):
+                return {"output": "\n".join(pod_files)}
+            if command.startswith("stat -c%s"):
+                return {"output": "2048"}
+            raise AssertionError(f"unexpected docker_execute call: {command!r}")
+
+        with patch.object(Bench, "docker_execute", side_effect=fake_docker_execute):
+            backups = site.fetch_latest_backup(with_files=False)
+
+        self.assertEqual(backups["database"]["file"], pod_files[0])
+        self.assertEqual(backups["database"]["size"], 2048)
+
+    def test_fetch_latest_backup_still_raises_when_host_dir_empty_and_not_in_cluster(self):
+        bench = self._get_bench(db_host="localhost")
+        site_name = "backed-up.local"
+        site_dir = os.path.join(self.sites_directory, site_name)
+        os.makedirs(site_dir)
+        with open(os.path.join(site_dir, "site_config.json"), "w") as f:
+            json.dump({"db_name": "fake", "db_password": "fake"}, f)
+        os.makedirs(os.path.join(site_dir, "private", "backups"))
+        site = Site(site_name, bench)
+
+        with self.assertRaises(ValueError):
+            site.fetch_latest_backup(with_files=False)
+
+    # -- update_config()/get_config()/set_config() after a successful
+    #    pod-only new-site (Site() no longer OSError's, per the fix above,
+    #    but the config read/write still hit the host) --
+
+    def test_update_config_reads_and_writes_via_pod_when_host_checkout_missing(self):
+        bench = self._get_bench(db_host="10.0.0.5")
+        site_config = {"db_name": "loop4_db", "db_password": "secret"}
+
+        with patch.object(Bench, "docker_execute", return_value={"output": json.dumps(site_config)}):
+            site = Site("loop4.local", bench)
+
+        written = {}
+
+        def fake_docker_execute(command, subdir=None, input=None, **kwargs):
+            if command == "cat site_config.json":
+                return {"output": json.dumps(site_config)}
+            if command == "cat > site_config.json":
+                written["subdir"] = subdir
+                written["value"] = json.loads(input)
+                return {"output": ""}
+            raise AssertionError(f"unexpected docker_execute call: {command!r}")
+
+        with patch.object(Bench, "docker_execute", side_effect=fake_docker_execute):
+            Site.update_config.__wrapped__(site, {"host_name": "https://loop4.local"})
+
+        self.assertEqual(written["subdir"], os.path.join("sites", "loop4.local"))
+        self.assertEqual(written["value"]["db_name"], "loop4_db")
+        self.assertEqual(written["value"]["host_name"], "https://loop4.local")
+
+    def test_update_config_still_uses_host_file_when_not_in_cluster(self):
+        bench = self._get_bench(db_host="localhost")
+        site_name = "host-mode.local"
+        self._create_test_site(site_name)
+        site = Site(site_name, bench)
+
+        Site.update_config.__wrapped__(site, {"host_name": "https://host-mode.local"})
+
+        with open(site.config_file) as f:
+            saved = json.load(f)
+        self.assertEqual(saved["host_name"], "https://host-mode.local")
+
+    def _create_test_site(self, site_name: str):
+        site_dir = os.path.join(self.sites_directory, site_name)
+        os.makedirs(site_dir)
+        with open(os.path.join(site_dir, "site_config.json"), "w") as f:
+            json.dump({"db_name": "fake", "db_password": "fake"}, f)
+
 
 if __name__ == "__main__":
     unittest.main()
